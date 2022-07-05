@@ -1,0 +1,13 @@
+single foo=bar
+bar
+----
+bar
+
+# a comment
+
+double
+bar
+----
+barbar
+
+# another comment
