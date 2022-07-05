@@ -37,19 +37,22 @@ pub fn main() anyerror!void {
 }
 
 test "basic test" {
-    var allocator = std.heap.GeneralPurposeAllocator(.{}){};
-    var alloc = allocator.allocator();
-    defer std.debug.assert(!allocator.deinit());
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
 
-    var runner = try Runner.load("testdata/t", alloc);
-    defer runner.finish();
+    var arena_alloc = arena.allocator();
+
+    var runner = try Runner.load("testdata/t", arena_alloc);
+    defer runner.finish() catch |err| {
+        std.debug.print("error: {s}\n", .{err});
+    };
 
     while (try runner.next()) |test_case| {
         if (std.mem.eql(u8, test_case.directive.command, "single")) {
             try runner.result(test_case.input);
         } else if (std.mem.eql(u8, test_case.directive.command, "double")) {
             // The whole arena will be deallocated at the end.
-            var out = std.ArrayList(u8).init(runner.arena.allocator());
+            var out = std.ArrayList(u8).init(arena_alloc);
             defer out.deinit();
             for (test_case.input) |ch| {
                 if (ch != '\n') {

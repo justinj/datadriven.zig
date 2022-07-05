@@ -11,15 +11,6 @@ const Item = union(ItemTag) {
     blank_line: u0,
     comment: []const u8,
     test_case: TestCase,
-
-    fn deinit(self: Item, alloc: Allocator) void {
-        switch (self) {
-            ItemTag.test_case => |test_case| test_case.deinit(alloc),
-            // We do not own the comments.
-            ItemTag.comment => {},
-            ItemTag.blank_line => {},
-        }
-    }
 };
 
 const DatadrivenError = error{
@@ -34,10 +25,6 @@ const TestCase = struct {
     directive: Directive,
     input: []const u8,
     output: []const u8,
-
-    fn deinit(self: TestCase, alloc: Allocator) void {
-        self.directive.deinit(alloc);
-    }
 
     pub fn format(
         self: TestCase,
@@ -55,13 +42,6 @@ const TestCase = struct {
 const Directive = struct {
     command: []const u8,
     arguments: []Argument,
-
-    fn deinit(self: Directive, alloc: Allocator) void {
-        for (self.arguments) |argument| {
-            argument.deinit(alloc);
-        }
-        alloc.free(self.arguments);
-    }
 
     pub fn format(
         self: Directive,
@@ -82,10 +62,6 @@ const Directive = struct {
 const Argument = struct {
     name: []const u8,
     values: [][]const u8,
-
-    fn deinit(self: Argument, alloc: Allocator) void {
-        alloc.free(self.values);
-    }
 
     pub fn format(
         self: Argument,
@@ -164,7 +140,6 @@ const Parser = struct {
         self.munch();
 
         var values = ArrayList([]const u8).init(self.alloc);
-        errdefer values.deinit();
 
         if (self.eat('=')) {
             self.munch();
@@ -203,22 +178,10 @@ const Parser = struct {
     }
 
     fn parseDirective(self: *Parser) !Directive {
-        std.debug.print("wait a second...{s}\n", .{self.alloc});
-        var aaa = ArrayList(u8).init(self.alloc);
-        std.debug.print("before...\n", .{});
-        try aaa.appendSlice("a");
-        std.debug.print("after...\n", .{});
-
         self.munch();
         var command = try self.parseWord();
         self.munch();
         var arguments = ArrayList(Argument).init(self.alloc);
-        errdefer {
-            for (arguments.items) |argument| {
-                argument.deinit(self.alloc);
-            }
-            arguments.deinit();
-        }
 
         while (self.peek() orelse '\n' != '\n') {
             try arguments.append(try self.parseArg());
@@ -329,8 +292,8 @@ test "test parsing directives" {
         output: ?[]const u8,
     };
 
-    var allocator = std.heap.GeneralPurposeAllocator(.{}){};
-    defer std.debug.assert(!allocator.deinit());
+    var allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer allocator.deinit();
     var alloc = allocator.allocator();
 
     const cases = [_]Case{
@@ -358,7 +321,6 @@ test "test parsing directives" {
             try std.testing.expectEqual(case.output, null);
             continue;
         };
-        defer dir.deinit(alloc);
 
         if (case.output) |output| {
             var formatted = try std.fmt.allocPrint(alloc, "{s}", .{dir});
@@ -381,8 +343,8 @@ test "test parsing entire test cases" {
         output: ?[]const u8,
     };
 
-    var allocator = std.heap.GeneralPurposeAllocator(.{}){};
-    defer std.debug.assert(!allocator.deinit());
+    var allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer allocator.deinit();
     var alloc = allocator.allocator();
 
     const cases = [_]Case{
@@ -401,7 +363,6 @@ test "test parsing entire test cases" {
             try std.testing.expectEqual(case.output, null);
             continue;
         };
-        defer dir.deinit(alloc);
 
         if (case.output) |output| {
             var formatted = try std.fmt.allocPrint(alloc, "{s}", .{dir});
@@ -432,15 +393,10 @@ const RunnerState = union(RunnerStateTag) {
 pub const Runner = struct {
     input_filename: []const u8,
     parser: Parser,
-    arena: std.heap.ArenaAllocator,
     state: RunnerState,
     output_buf: ?ArrayList(u8),
 
-    pub fn load(filename: []const u8, parent_alloc: Allocator) !Runner {
-        _ = parent_alloc;
-        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-        var allocator = arena.allocator();
-
+    pub fn load(filename: []const u8, allocator: Allocator) !Runner {
         var file = try std.fs.cwd().openFile(filename, .{});
         defer file.close();
 
@@ -459,7 +415,6 @@ pub const Runner = struct {
         return Runner{
             .input_filename = filename,
             .parser = parser,
-            .arena = arena,
             .state = RunnerState.pending,
             .output_buf = output_buf,
         };
@@ -479,8 +434,10 @@ pub const Runner = struct {
             switch (item) {
                 ItemTag.test_case => |test_case| {
                     if (self.output_buf) |*buf| {
-                        _ = buf;
-                        // try test_case.directive.format("{s}\n", .{}, buf.writer());
+                        try test_case.directive.format("{s}", .{}, buf.writer());
+                        try buf.append('\n');
+                        try buf.appendSlice(test_case.input);
+                        try buf.appendSlice("----\n");
                     }
                     self.state = RunnerState{ .running_test = test_case };
                     return test_case;
@@ -493,7 +450,6 @@ pub const Runner = struct {
                 ItemTag.comment => |comment| {
                     if (self.output_buf) |*buf| {
                         try buf.appendSlice(comment);
-                        try buf.append('\n');
                     }
                 },
             }
@@ -511,14 +467,19 @@ pub const Runner = struct {
                 return DatadrivenError.FileCompleted;
             },
             .running_test => |case| {
-                if (!std.mem.eql(u8, v, case.output)) {
-                    std.debug.print(
-                        "FAILURE:\nEXPECTED:\n{s}\n\nACTUAL:\n{s}\n",
-                        .{
-                            case.output,
-                            v,
-                        },
-                    );
+                if (self.output_buf) |*buf| {
+                    try buf.appendSlice(v);
+                    try buf.append('\n');
+                } else {
+                    if (!std.mem.eql(u8, v, case.output)) {
+                        std.debug.print(
+                            "FAILURE:\nEXPECTED:\n{s}\n\nACTUAL:\n{s}\n",
+                            .{
+                                case.output,
+                                v,
+                            },
+                        );
+                    }
                 }
                 self.state = RunnerState{ .pending = 0 };
             },
@@ -541,12 +502,16 @@ pub const Runner = struct {
         self.state = RunnerState{ .pending = 0 };
     }
 
-    pub fn finish(self: Runner) void {
-        // todo: I guess do the rewrite?
-        defer self.arena.deinit();
-
+    pub fn finish(self: Runner) !void {
+        // Now attempt to overwrite the old one.
         if (self.output_buf) |*buf| {
-            std.debug.print("\n```\n\n{s}\n```\n\n", .{buf.items});
+            var file = try std.fs.cwd().createFile(self.input_filename, .{
+                .truncate = true,
+            });
+            // Truncate the file.
+            try file.setEndPos(0);
+            defer file.close();
+            try file.writeAll(buf.items);
         }
     }
 };
@@ -557,8 +522,8 @@ test "test parsing entire file" {
         output: ?[]const u8,
     };
 
-    var allocator = std.heap.GeneralPurposeAllocator(.{}){};
-    defer std.debug.assert(!allocator.deinit());
+    var allocator = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer allocator.deinit();
     var alloc = allocator.allocator();
 
     const cases = [_]Case{
@@ -586,28 +551,23 @@ test "test parsing entire file" {
     for (cases) |case| {
         var parser = Parser.new(alloc, case.input);
 
-        while (try parser.nextItem()) |item| {
-            defer item.deinit(alloc);
+        var dir = parser.parseTestCase() catch {
+            // Parse error: the expectation should be null.
+            try std.testing.expectEqual(case.output, null);
+            continue;
+        };
+
+        if (case.output) |output| {
+            var formatted = try std.fmt.allocPrint(alloc, "{s}", .{dir});
+            defer alloc.free(formatted);
+
+            std.testing.expect(std.mem.eql(u8, output, formatted)) catch {
+                std.debug.print("expected equal:\n```\n{s}```\n{s}```\n", .{ output, formatted });
+                try std.testing.expect(false);
+            };
+        } else {
+            std.debug.print("shouldn't have parsed, but it did", .{});
+            try std.testing.expect(false);
         }
-
-        // var dir = parser.parseTestCase() catch {
-        //     // Parse error: the expectation should be null.
-        //     try std.testing.expectEqual(case.output, null);
-        //     continue;
-        // };
-        // defer dir.deinit(alloc);
-
-        // if (case.output) |output| {
-        //     var formatted = try std.fmt.allocPrint(alloc, "{s}", .{dir});
-        //     defer alloc.free(formatted);
-
-        //     std.testing.expect(std.mem.eql(u8, output, formatted)) catch {
-        //         std.debug.print("expected equal:\n```\n{s}```\n{s}```\n", .{ output, formatted });
-        //         try std.testing.expect(false);
-        //     };
-        // } else {
-        //     std.debug.print("shouldn't have parsed, but it did", .{});
-        //     try std.testing.expect(false);
-        // }
     }
 }
